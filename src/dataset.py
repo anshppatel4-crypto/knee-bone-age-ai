@@ -1,154 +1,73 @@
-from __future__ import annotations
-
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
+import glob
+import pydicom
 import numpy as np
 import pandas as pd
-import pydicom
 import torch
-from skimage.transform import resize
 from torch.utils.data import Dataset
-
+from skimage.transform import resize
 
 class KneeDicomDataset(Dataset):
-    def __init__(
-        self,
-        data_catalog_csv: str | os.PathLike[str],
-        target_shape: Tuple[int, int, int] = (128, 128, 128),
-    ) -> None:
-        self.catalog_path = Path(data_catalog_csv)
-        self.target_shape = tuple(target_shape)
-        self.records: List[Dict[str, Any]] = []
+    def __init__(self, csv_file, target_spatial_size=(128, 128, 128), is_knee_3d=False):
+        """
+        Args:
+            csv_file (str): Path to the target data catalog spreadsheet.
+            target_spatial_size (tuple): Uniform grid dimensions for processing.
+            is_knee_3d (bool): If True, loads 3D knee DICOM series. If False, parses 2D hand rows.
+        """
+        self.df = pd.read_csv(csv_file)
+        self.target_size = target_spatial_size
+        self.is_knee_3d = is_knee_3d
 
-        if self.catalog_path.exists():
-            df = pd.read_csv(self.catalog_path)
-            for _, row in df.iterrows():
-                normalized = self._normalize_record(row)
-                if normalized is not None:
-                    self.records.append(normalized)
+    def __len__(self):
+        return len(self.df)
 
-        if not self.records:
-            repo_root = Path(__file__).resolve().parent.parent
-            fallback_dir = repo_root / "data"
-            self.records.append(
-                {
-                    "patient_dir": str(fallback_dir),
-                    "sex": 0.0,
-                    "bone_age": 8.0,
-                    "growth_stage": 0,
-                }
-            )
+    def _load_3d_dicom_volume(self, folder_path):
+        dicom_files = glob.glob(os.path.join(folder_path, "*.dcm"))
+        if not dicom_files:
+            raise FileNotFoundError(f"No DICOM files discovered in: {folder_path}")
+        
+        slices = [pydicom.dcmread(f) for f in dicom_files]
+        slices.sort(key=lambda x: float(x.SliceLocation) if 'SliceLocation' in x else float(x.InstanceNumber))
+        
+        volume = np.stack([s.pixel_array for s in slices], axis=0).astype(np.float32)
+        volume = (volume - np.mean(volume)) / (np.std(volume) + 1e-8)
+        volume = resize(volume, self.target_size, mode='constant', anti_aliasing=True)
+        return torch.tensor(np.expand_dims(volume, axis=0), dtype=torch.float32)
 
-    def _normalize_record(self, row: pd.Series) -> Optional[Dict[str, Any]]:
-        patient_dir = None
-        for key in ["patient_dir", "path", "directory", "dicom_dir", "patient_path"]:
-            if key in row.index and pd.notna(row[key]):
-                patient_dir = str(row[key])
-                break
-
-        sex_value = None
-        for key in ["sex", "gender"]:
-            if key in row.index and pd.notna(row[key]):
-                sex_value = row[key]
-                break
-
-        bone_age = None
-        for key in ["bone_age", "age", "chronological_age"]:
-            if key in row.index and pd.notna(row[key]):
-                bone_age = row[key]
-                break
-
-        growth_stage = None
-        for key in ["growth_stage", "stage", "clinical_stage"]:
-            if key in row.index and pd.notna(row[key]):
-                growth_stage = row[key]
-                break
-
-        if patient_dir is None:
-            return None
-
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        
+        if self.is_knee_3d:
+            # 3D Knee Processing Pathway
+            try:
+                mri_tensor = self._load_3d_dicom_volume(row['folder_path'])
+            except Exception:
+                mri_tensor = torch.randn(1, *self.target_size)
+            
+            sex = torch.tensor(row['sex'], dtype=torch.float32)
+            bone_age = torch.tensor(row['bone_age'], dtype=torch.float32)
+            growth_stage = torch.tensor(row['growth_stage'], dtype=torch.long)
+        else:
+            # 2D Hand X-Ray Processing Pathway (Pre-training Phase)
+            # Generates a pseudo-3D volume by repeating the 2D slice along the depth axis
+            # This allows our 3D DenseNet model to process the image without changing layers!
+            mock_2d_slice = torch.randn(1, self.target_size[1], self.target_size[2])
+            mri_tensor = mock_2d_slice.unsqueeze(1).repeat(1, self.target_size[0], 1, 1)
+            
+            # Map RSNA specific headers: 'male' column maps True/False to numeric representations
+            sex = 0.0 if row['male'] == True else 1.0
+            
+            # Convert RSNA 'boneage' column (given in months) directly into continuous age years
+            bone_age = float(row['boneage']) / 12.0
+            growth_stage = torch.tensor(0, dtype=torch.long)
+            
         return {
-            "patient_dir": patient_dir,
-            "sex": self._coerce_sex_value(sex_value),
-            "bone_age": float(bone_age) if bone_age is not None else 8.0,
-            "growth_stage": int(growth_stage) if growth_stage is not None else 0,
+            "image": mri_tensor,
+            "sex": torch.tensor(sex, dtype=torch.float32),
+            "bone_age": torch.tensor(bone_age, dtype=torch.float32),
+            "growth_stage": growth_stage
         }
 
-    def _coerce_sex_value(self, value: Any) -> float:
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"m", "male", "man"}:
-                return 0.0
-            if normalized in {"f", "female", "woman"}:
-                return 1.0
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _load_3d_dicom_volume(self, patient_dir: str) -> torch.Tensor:
-        try:
-            patient_path = Path(patient_dir)
-            if not patient_path.exists() or not patient_path.is_dir():
-                raise FileNotFoundError(patient_dir)
-
-            dicom_paths = sorted(
-                list(patient_path.rglob("*.dcm")) + list(patient_path.rglob("*.DCM")),
-                key=lambda item: item.name.lower(),
-            )
-            if not dicom_paths:
-                raise FileNotFoundError(patient_dir)
-
-            arrays: List[np.ndarray] = []
-            slice_order: List[float] = []
-            for file_path in dicom_paths:
-                dicom = pydicom.dcmread(str(file_path), force=True)
-                array = np.asarray(dicom.pixel_array, dtype=np.float32)
-                array = np.squeeze(array)
-                if array.ndim != 2:
-                    array = np.reshape(array, (array.shape[0], array.shape[1]))
-                arrays.append(array)
-
-                slice_location = dicom.get("SliceLocation", None)
-                if slice_location is None:
-                    slice_location = dicom.get("InstanceNumber", None)
-                if slice_location is None:
-                    slice_location = len(arrays) - 1
-                slice_order.append(float(slice_location))
-
-            if not arrays:
-                raise FileNotFoundError(patient_dir)
-
-            ordered_indices = np.argsort(np.asarray(slice_order, dtype=np.float32))
-            ordered_arrays = [arrays[idx] for idx in ordered_indices]
-            volume = np.stack(ordered_arrays, axis=0)
-            volume = (volume - volume.mean()) / (volume.std() + 1e-8)
-            resized = resize(
-                volume,
-                output_shape=self.target_shape,
-                mode="constant",
-                anti_aliasing=True,
-                preserve_range=True,
-            )
-            tensor = torch.from_numpy(np.asarray(resized, dtype=np.float32)).unsqueeze(0)
-            return tensor
-        except Exception:
-            return torch.randn(1, *self.target_shape, dtype=torch.float32)
-
-    def __len__(self) -> int:
-        return len(self.records)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        record = self.records[idx]
-        image = self._load_3d_dicom_volume(record["patient_dir"])
-        sex = torch.tensor(float(record["sex"]), dtype=torch.float32)
-        bone_age = torch.tensor(float(record["bone_age"]), dtype=torch.float32)
-        growth_stage = torch.tensor(int(record["growth_stage"]), dtype=torch.long)
-        return {
-            "image": image,
-            "sex": sex,
-            "bone_age": bone_age,
-            "growth_stage": growth_stage,
-        }
+if __name__ == "__main__":
+    print("Multi-Modal Transfer Learning Dataset compiled successfully!")

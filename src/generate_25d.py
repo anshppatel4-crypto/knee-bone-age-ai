@@ -21,7 +21,12 @@ def save_single_dicom_slice(pixel_array_2d, output_path, slice_idx, spacing_mm=3
     file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.4'  # MR Image Storage Code
     file_meta.MediaStorageSOPInstanceUID = generate_uid()
     
-    ds = FileDataset(output_path, {}, file_meta=file_meta, local_media_storage_sop_class_uid='1.2.840.10008.5.1.4.1.1.4')
+    # FIX: Clean initialization without the deprecated keyword argument conflict
+    ds = FileDataset(output_path, {}, file_meta=file_meta)
+    
+    # Set explicit clinical byte patterns required by pydicom
+    ds.is_little_endian = True
+    ds.is_implicit_VR = False
     
     # Inject exact physical metadata required by your dataset.py script
     ds.SliceLocation = float(slice_idx * spacing_mm)  # Track depth position precisely
@@ -74,8 +79,9 @@ def execute_25d_volumetric_generation(target_age=13.5, patient_sex="M", total_sl
         
         negative_prompt = "color, text, watermarks, bad anatomy, corrupted pixels, artifacts, 3d render"
         
-        # Synthesize a single 2D image plane 
+        # Synthesize a single 2D image plane
         with torch.no_grad():
+            # FIX: Extracted [0] correctly on the outside of the image generation call
             image = pipeline(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=20).images[0]
             
         # Strip color channels and map pixels to a 2D float matrix array
@@ -103,6 +109,7 @@ def execute_25d_volumetric_generation(target_age=13.5, patient_sex="M", total_sl
         )
         
     print(f"✅ Success! Your valid 3D pediatric knee DICOM folder is fully populated at: {output_dir}")
+
 
 if __name__ == "__main__":
     # Test your new generation engine by creating an initial 8-slice target volume

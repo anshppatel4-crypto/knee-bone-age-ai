@@ -1,9 +1,7 @@
 from __future__ import annotations
-
 import torch
 from monai.networks.nets import DenseNet121
 from torch import nn
-
 
 class KneeBoneAgeMultiTaskNet(nn.Module):
     def __init__(self, num_growth_stages: int = 4) -> None:
@@ -26,11 +24,22 @@ class KneeBoneAgeMultiTaskNet(nn.Module):
     def forward(self, image: torch.Tensor, sex: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         image = image.float()
         sex = sex.float().view(-1, 1)
+        
         spatial_features = self.backbone(image)
         spatial_features = self._collapse_spatial_features(spatial_features)
+        
         sex_features = self.sex_encoder(sex)
+        
         fused_features = torch.cat([spatial_features, sex_features], dim=1)
         shared_representation = self.fusion(fused_features)
-        predicted_age = self.regression_head(shared_representation).squeeze(-1)
+        
+        raw_age = self.regression_head(shared_representation).squeeze(-1)
         predicted_stage = self.stage_head(shared_representation)
+        
+        # 👑 THE BOUNDED OUTPUT SCALING LAYER
+        # Passing raw output vectors through a Sigmoid maps the scales directly to [0.0, 1.0].
+        # Multiplying by 20.0 limits predictions to [0.0, 20.0] human years.
+        # This keeps gradient steps stable and ensures your predictions map to realistic adolescent values.
+        predicted_age = torch.sigmoid(raw_age) * 20.0
+        
         return predicted_age, predicted_stage

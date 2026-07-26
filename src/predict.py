@@ -10,9 +10,9 @@ def load_and_sort_dicom_volume(dicom_dir):
 
     by their physical SliceLocation metadata, and stacks them into a 3D tensor.
     """
-    # 1. Read all files inside the directory that look like DICOM files
+    # 1. Read all files inside the directory, using force=True to handle custom generated data
     dicom_files = [
-        pydicom.dcmread(os.path.join(dicom_dir, f)) 
+        pydicom.dcmread(os.path.join(dicom_dir, f), force=True) 
         for f in os.listdir(dicom_dir) 
         if f.lower().endswith('.dcm') or f.lower().endswith('.dicom') or f.lower().startswith('slice_')
     ]

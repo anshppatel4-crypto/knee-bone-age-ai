@@ -3,12 +3,13 @@ import argparse
 import pydicom
 import numpy as np
 import torch
+from scipy.ndimage import zoom
 from src.model import KneeBoneAgeMultiTaskNet
 
-def load_and_sort_dicom_volume(dicom_dir):
+def load_and_sort_dicom_volume(dicom_dir, target_depth=64, target_resolution=256):
     """Parses a directory containing raw DICOM slices, sorts them chronologically
 
-    by their physical SliceLocation metadata, and stacks them into a 3D tensor.
+    by physical SliceLocation, and resizes the volume to a standardized 3D matrix.
     """
     # 1. Read all files inside the directory, using force=True to handle custom generated data
     dicom_files = [
@@ -21,7 +22,6 @@ def load_and_sort_dicom_volume(dicom_dir):
         raise FileNotFoundError(f"❌ Error: No readable DICOM slices found in target directory: {dicom_dir}")
         
     # 2. Sort the slices strictly along the physical Z-axis using the scanner metadata tags
-    # This prevents the system from reading slices out of order if the file names are random.
     dicom_files.sort(key=lambda x: float(x.SliceLocation) if 'SliceLocation' in x else 0.0)
     
     # 3. Extract the raw pixel grids and stack them: Shape (Slices, Height, Width)
@@ -30,6 +30,19 @@ def load_and_sort_dicom_volume(dicom_dir):
     # 4. Standardize and normalize pixel intensity values to the [0.0, 1.0] window
     volume = volume.astype(np.float32)
     volume = (volume - np.min(volume)) / (np.max(volume) - np.min(volume) + 1e-8)
+    
+    # 5. FIXED: 3D Volumetric Standardizer
+    # Resizes the input volume to exactly (64, 256, 256) so MONAI's 3D layers don't collapse
+    current_d, current_h, current_w = volume.shape
+    print(f"📐 Standardizing volume: Current shape ({current_d}, {current_h}, {current_w})")
+    
+    zoom_d = target_depth / current_d
+    zoom_h = target_resolution / current_h
+    zoom_w = target_resolution / current_w
+    
+    # Apply bilinear/trilinear spline interpolation scaling
+    print(f"🔄 Interpolating 3D matrices to clinical target grid ({target_depth}, {target_resolution}, {target_resolution})...")
+    volume = zoom(volume, (zoom_d, zoom_h, zoom_w), order=1)
     
     return volume
 
@@ -51,7 +64,7 @@ def run_production_inference(dicom_dir, biological_sex, weights_path):
         print(f"⚠️ Warning: Checkpoint '{weights_path}' not found. Running inference with initialization baselines.")
         
     model.to(device)
-    model.eval()  # Put layers like Batch Normalization and Dropout into locked evaluation mode
+    model.eval()  # Put layers into locked evaluation mode
     
     # 3. Read and process the target 3D image stack volume
     volume = load_and_sort_dicom_volume(dicom_dir)
@@ -59,11 +72,11 @@ def run_production_inference(dicom_dir, biological_sex, weights_path):
     # Expand dimensions to fit PyTorch batch constraints: Shape (Batch=1, Channels=1, Depth, Height, Width)
     volume_tensor = torch.tensor(volume, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
     
-    # 4. Process sex metadata: 1.0 for Male, 0.0 for Female to match your network's embedded timeline layers
+    # 4. Process sex metadata: 1.0 for Male, 0.0 for Female to match your network's embedded layers
     sex_value = 1.0 if biological_sex.lower() in ['m', 'male'] else 0.0
     sex_tensor = torch.tensor([sex_value], dtype=torch.float32).unsqueeze(0).to(device)
     
-    # 5. Perform the forward pass without tracking gradients (saves massive memory and computation speed)
+    # 5. Perform the forward pass without tracking gradients
     with torch.no_grad():
         age_prediction, stage_prediction = model(volume_tensor, sex_tensor)
         

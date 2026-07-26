@@ -64,8 +64,9 @@ class KneeDicomDataset(Dataset):
             
         return {
             "image": mri_tensor,
-            "sex": torch.tensor(sex, dtype=torch.float32),
-            "bone_age": torch.tensor(bone_age, dtype=torch.float32),
+         # Replace the old torch.tensor() wraps with clone().detach()
+"sex": sex.clone().detach().astype(torch.float32) if torch.is_tensor(sex) else torch.tensor(sex, dtype=torch.float32),
+"bone_age": bone_age.clone().detach().astype(torch.float32) if torch.is_tensor(bone_age) else torch.tensor(bone_age, dtype=torch.float32),
             "growth_stage": growth_stage
         }
 

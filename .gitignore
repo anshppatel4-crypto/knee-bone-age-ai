@@ -1,0 +1,14 @@
+# Python bytecode cache data
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Local clinical medical datasets (Contains private PHI data)
+data/
+*.dcm
+*.dicom
+
+# OS specific hidden tracking files
+.DS_Store
+Thumbs.db

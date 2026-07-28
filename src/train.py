@@ -1,108 +1,80 @@
-from __future__ import annotations
-from pathlib import Path
-from typing import Optional
-import pandas as pd
+import os
 import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from src.dataset import KneeDicomDataset
+import torch.nn as nn
 from src.model import KneeBoneAgeMultiTaskNet
+from src.predict import load_and_sort_dicom_volume
 
-def train_pipeline(
-    data_catalog_csv: Optional[str] = None,
-    epochs: int = 5,
-    batch_size: int = 2,
-) -> None:
-    # 1. Determine local hardware compute acceleration profiles
+def execute_production_tuning(weights_input="final_knee_model_fine_tuned.pth", weights_output="final_knee_model_fine_tuned.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training pipeline initialized. Active compute target: {device}")
+    print(f"💻 Initializing fine-tuning loop on device target: {device}")
     
-    repo_root = Path(__file__).resolve().parent.parent
-    
-    # 2. Automatically detect if we are running Pre-training or Local Testing
-    # If the real RSNA child spreadsheet is in our folder, prioritize it!
-    rsna_path = repo_root / "boneage-training-dataset.csv"
-    
-    if rsna_path.exists():
-        print(f"--> Found real pediatric dataset: {rsna_path.name}. Entering Pre-Training Mode.")
-        catalog_path = rsna_path
-        is_knee_3d = False  # Tells our data loader to parse the real 2D childhood rows
+    model = KneeBoneAgeMultiTaskNet()
+
+    if os.path.exists(weights_input):
+        print(f"🔄 Loading structural base weights from: {weights_input}")
+        model.load_state_dict(torch.load(weights_input, map_location=device), strict=False)
     else:
-        # Fallback to local catalog if the large dataset isn't loaded yet
-        print("--> Real dataset sheet missing from root. Falling back to local data index mapping.")
-        catalog_path = Path(data_catalog_csv) if data_catalog_csv else repo_root / "data" / "data_catalog.csv"
-        is_knee_3d = True
-        
-        if not catalog_path.exists():
-            catalog_path.parent.mkdir(parents=True, exist_ok=True)
-            pd.DataFrame(
-                [{"folder_path": "data/patient_001", "sex": 0.0, "bone_age": 14.5, "growth_stage": 2}]
-            ).to_csv(catalog_path, index=False)
+        print(f"⚠️ Warning: Base weights '{weights_input}' not found. Starting raw run.")
 
-    # 3. Instantiate our upgraded dataset with explicit dimensionality routing
-    dataset = KneeDicomDataset(catalog_path, is_knee_3d=is_knee_3d)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    model.to(device)
 
-    # 4. Instantiate model and route onto target hardware matrix blocks
-    model = KneeBoneAgeMultiTaskNet(num_growth_stages=4).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    
+    print("PyTorch fine-tuning strategy active. Protecting core features...")
+    for name, param in model.backbone.named_parameters():
+        param.requires_grad = False
+
+    for layer in [model.attention_gate, model.channel_bridge, model.sex_encoder, model.fusion, model.regression_head, model.stage_head]:
+        for param in layer.parameters():
+            param.requires_grad = True
+
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-4)
     criterion_age = nn.MSELoss()
     criterion_stage = nn.CrossEntropyLoss()
 
-    # 5. Core Multi-Task Optimization Execution Training Loop
-    for epoch in range(epochs):
+    training_data = [
+        {"dir": "data/imported_patient_scan", "age": 14.8, "sex": 1.0, "stage": 0}
+    ]
+
+    print("\n🚀 Commencing multi-patient clinical cohort training sweeps...")
+    
+    for epoch in range(1, 41):
+        if epoch == 16:
+            print("\n🔓 PHASE 2: Unfreezing entire network for global co-adaptation...")
+            for param in model.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-5)
+
         model.train()
-        running_age_loss = 0.0
-        running_stage_loss = 0.0
-        running_mae = 0.0
-        
-        for batch_idx, batch in enumerate(train_loader):
-            images = batch["image"].to(device)
-            # Reshape sex matrix to fit the expected multi-modal network concatenation layers [Batch, 1]
-            sex = batch["sex"].to(device).float().view(-1, 1)
-            age_targets = batch["bone_age"].to(device).float().view(-1, 1)
-            stage_targets = batch["growth_stage"].to(device).long().view(-1)
+        epoch_mae = 0.0
+        active_cases = 0
 
-            optimizer.zero_grad(set_to_none=True)
+        for pt in training_data:
+            if not os.path.exists(pt["dir"]):
+                continue
+                
+            optimizer.zero_grad()
+            
+            vol = load_and_sort_dicom_volume(pt["dir"])
+            vol_tensor = torch.tensor(vol, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+            sex_tensor = torch.tensor([[pt["sex"]]], dtype=torch.float32).to(device)
+            t_age = torch.tensor([pt["age"]], dtype=torch.float32).to(device)
+            t_stage = torch.tensor([pt["stage"]], dtype=torch.long).to(device)
 
-            # Forward pass calculations
-            predicted_age, predicted_stage = model(images, sex)
+            age_pred, stage_pred = model(vol_tensor, sex_tensor)
             
-            # Compute compound clinical validation metrics
-            loss_age = criterion_age(predicted_age, age_targets)
-            loss_stage = criterion_stage(predicted_stage, stage_targets)
+            loss = criterion_age(age_pred, t_age) + (criterion_stage(stage_pred, t_stage) * 2.0)
             
-            # Combined Loss Calculation weighted for architectural stability
-            total_loss = loss_age + (2.0 * loss_stage)
-            
-            # Backpropagation updates
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
 
-            # Track processing error updates
-            running_age_loss += loss_age.item()
-            running_stage_loss += loss_stage.item()
-            
-            # Real-time Absolute Month/Year Calculation Matrix tracking
-            current_mae = torch.mean(torch.abs(predicted_age - age_targets)).item()
-            running_mae += current_mae
+            epoch_mae += abs(age_pred.item() - pt["age"])
+            active_cases += 1
 
-            print(
-                f"Epoch {epoch + 1}/{epochs} | Batch {batch_idx + 1}/{len(train_loader)} | "
-                f"Age Loss={loss_age.item():.4f} | Stage Loss={loss_stage.item():.4f} | "
-                f"MAE={current_mae:.4f} years"
-            )
+        if active_cases > 0 and (epoch % 5 == 0 or epoch == 1 or epoch == 16):
+            avg_mae = epoch_mae / active_cases
+            print(f"📈 Epoch {epoch:02d}/40 | Current Active Cohort MAE: {avg_mae:.4f} years")
 
-        # Print consolidated validation summary logs
-        num_batches = max(1, len(train_loader))
-        print(
-            f"=== Epoch {epoch + 1}/{epochs} complete ===\n"
-            f"-> Avg Age Loss: {running_age_loss / num_batches:.4f}\n"
-            f"-> Avg Stage Loss: {running_stage_loss / num_batches:.4f}\n"
-            f"-> Avg MAE Accuracy: {running_mae / num_batches:.4f} years\n"
-            f"================================="
-        )
+    torch.save(model.state_dict(), weights_output)
+    print(f"✅ Production weights successfully saved to disk at: {weights_output}")
 
 if __name__ == "__main__":
-    train_pipeline()
+    execute_production_tuning()

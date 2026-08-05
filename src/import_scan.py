@@ -5,21 +5,18 @@ import pydicom
 from collections import defaultdict
 
 def ingest_recursive_dicom_folder(source_root, output_target_dir="data/imported_patient_scan"):
-    """Recursively walks through subfolders, groups files by Series ID to isolate 
-
-    the dominant 3D volume, and cleanly ingests it.
+    """Recursively walks through subfolders, filters specifically for Sagittal/Coronal 
+    structural series, and cleanly ingests the targets to prevent Axial pollution.
     """
     if not os.path.exists(source_root):
         raise FileNotFoundError(f"❌ Source directory path not found: {source_root}")
         
-    # Clear old junk out of target directory to prevent mixed-run pollution
     if os.path.exists(output_target_dir):
         shutil.rmtree(output_target_dir)
     os.makedirs(output_target_dir, exist_ok=True)
     
-    print(f"🔍 Initializing structural series search across root directory: {source_root}")
+    print(f"🔍 Initializing targeted structural series search across root directory: {source_root}")
     
-    # Group filepaths dynamically by their internal Series UID
     series_groups = defaultdict(list)
     series_descriptions = {}
 
@@ -40,19 +37,32 @@ def ingest_recursive_dicom_folder(source_root, output_target_dir="data/imported_
         print("❌ Ingestion Failure: Unable to parse any valid DICOM series UIDs.")
         return None
 
-    # Identify the structural sequence by pulling the series containing the most files
-    best_series_uid = max(series_groups, key=lambda k: len(series_groups[k]))
+    best_series_uid = None
+    for uid, files in series_groups.items():
+        desc = series_descriptions.get(uid, "").lower()
+        if "ax" in desc or "axial" in desc or "localizer" in desc or "scout" in desc:
+            continue
+        if "sag" in desc or "cor" in desc or "t1" in desc or "structural" in desc:
+            best_series_uid = uid
+            break
+
+    if best_series_uid is None:
+        valid_uids = [u for u in series_groups.keys() if "ax" not in series_descriptions.get(u, "").lower()]
+        if valid_uids:
+            best_series_uid = max(valid_uids, key=lambda k: len(series_groups[k]))
+        else:
+            best_series_uid = max(series_groups, key=lambda k: len(series_groups[k]))
+
     chosen_files = series_groups[best_series_uid]
     desc = series_descriptions.get(best_series_uid, "Unknown Sequence")
 
-    print(f"🎯 Isolated Dominant Series: {desc} ({len(chosen_files)} slices)")
+    print(f"🎯 Isolated Target Structural Series: {desc} ({len(chosen_files)} slices)")
 
     valid_count = 0
     for file_path in chosen_files:
         try:
             ds = pydicom.dcmread(file_path, force=True)
             if hasattr(ds, 'pixel_array') and ds.pixel_array is not None:
-                # Maintain the original file name or an explicit index string
                 destination_path = os.path.join(output_target_dir, f"slice_{valid_count:03d}.dcm")
                 shutil.copy2(file_path, destination_path)
                 valid_count += 1

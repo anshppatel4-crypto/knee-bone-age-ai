@@ -1,14 +1,19 @@
-# Python bytecode cache data
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
+# Ignore virtual environment
+.venv-1/
+venv/
+env/
 
-# Local clinical medical datasets (Contains private PHI data)
+# Ignore synthetic data
 data/
+datasets/
+dicom/
 *.dcm
-*.dicom
 
-# OS specific hidden tracking files
-.DS_Store
-Thumbs.db
+# Ignore SD model weights
+models/
+*.ckpt
+*.safetensors
+
+# Ignore Python cache
+__pycache__/
+*.pyc

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import sys, os
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from pathlib import Path
 from typing import Optional
 import pandas as pd
@@ -31,13 +33,23 @@ def train_pipeline(data_catalog_csv: Optional[str] = None, epochs: int = 5, batc
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
 
     model = KneeBoneAgeMultiTaskNet(num_growth_stages=4).to(device)
-    
+
+    # Attempt to load existing fine-tuned weights if available
+    prev_weights = repo_root / "final_knee_model_fine_tuned.pth"
+    if prev_weights.exists():
+        try:
+            model.load_state_dict(torch.load(prev_weights, map_location=device))
+            print(f"--> Loaded pre-existing weights from: {prev_weights.name}")
+        except Exception as e:
+            print(f"⚠️ Warning: failed to load existing weights ({prev_weights}): {e}")
+
     # Freeze backbone initially for custom attention compatibility
     for name, param in model.backbone.named_parameters():
         param.requires_grad = False
         
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
-    criterion_age = nn.MSELoss()
+    # Use L1Loss for bone age regression as requested (more robust to outliers)
+    criterion_age = nn.L1Loss()
     criterion_stage = nn.CrossEntropyLoss()
 
     for epoch in range(epochs):
@@ -69,9 +81,9 @@ def train_pipeline(data_catalog_csv: Optional[str] = None, epochs: int = 5, batc
 
             print(f"Epoch {epoch + 1}/{epochs} | Batch {batch_idx + 1}/{len(train_loader)} | MAE={current_mae:.4f} years")
 
-    # Save out updated state representations cleanly
-    torch.save(model.state_dict(), repo_root / "final_knee_model_fine_tuned.pth")
-    print("✅ Model tuning step complete. Checkpoint exported.")
+    # Save out updated state representations cleanly (bio-physics enhanced fine-tune)
+    torch.save(model.state_dict(), repo_root / "final_knee_model_bio_physics.pth")
+    print("✅ Model bio-physics fine-tuning complete. Checkpoint exported as final_knee_model_bio_physics.pth")
 
 if __name__ == "__main__":
     train_pipeline()

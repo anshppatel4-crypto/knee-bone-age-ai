@@ -1,10 +1,11 @@
-import os
+import sys, os
 import argparse
 import pydicom
 import numpy as np
 import torch
 import collections
 from scipy.ndimage import zoom, gaussian_filter
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.model import KneeBoneAgeMultiTaskNet
 
 def load_and_sort_dicom_volume(dicom_dir, target_depth=64, target_resolution=256):

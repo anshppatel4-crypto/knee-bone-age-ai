@@ -1,11 +1,15 @@
-import os
+import sys, os
 import torch
 import numpy as np
 import pydicom
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from diffusers import StableDiffusionPipeline
 from scipy.ndimage import gaussian_filter1d
 from pydicom.dataset import FileDataset, Dataset
 from pydicom.uid import ExplicitVRLittleEndian, generate_uid
+
+# Biological enhancer for synthetic MRI volumes
+from src.synthetic_biology import enhance_synthetic_knee
 
 # =========================================================================
 # HELPER 1: WRITING INDIVIDUAL CLINICAL DICOM FILES
@@ -100,7 +104,15 @@ def execute_25d_volumetric_generation(target_age=13.5, patient_sex="M", total_sl
         
     # Baseline fine-frequency blurring to lock edge distributions
     smoothed_volume_matrix = gaussian_filter1d(volume_matrix, sigma=0.8, axis=0)
-    
+
+    # Apply biologically-informed and MRI-physics based enhancements to the full volume
+    # ensure the enhancer receives a [D, H, W] numpy array and an age in years
+    try:
+        smoothed_volume_matrix = enhance_synthetic_knee(smoothed_volume_matrix.astype(np.float32), float(target_age))
+    except Exception as e:
+        # If enhancement fails for any reason, fall back to the smoothed result
+        print(f"⚠️ Warning: enhancement failed, continuing with smoothed volume: {e}")
+
     # 3. Save each anatomically optimized frame directly into uncorrupted clinical binaries
     print(f"💾 Committing processed volumes safely into raw DICOM binaries...")
     for z in range(total_slices):

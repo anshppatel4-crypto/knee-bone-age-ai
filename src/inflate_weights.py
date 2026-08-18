@@ -1,6 +1,7 @@
-import os
+import sys, os
 import torch
 import numpy as np
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.model import KneeBoneAgeMultiTaskNet
 
 def execute_scale_aware_inflation(pretrained_2d_path, output_3d_path):

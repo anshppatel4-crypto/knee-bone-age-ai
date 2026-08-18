@@ -1,8 +1,9 @@
-import os
+import sys, os
 import torch
 import numpy as np
 from diffusers import StableDiffusionPipeline
 from scipy.ndimage import gaussian_filter1d
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.generate_25d import save_single_dicom_slice
 
 def build_local_cohort():

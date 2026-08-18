@@ -1,4 +1,4 @@
-import os
+import sys, os
 import glob
 import pydicom
 import numpy as np
@@ -6,6 +6,9 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 from skimage.transform import resize
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+# Biological enhancer for synthetic MRI volumes
+from src.synthetic_biology import enhance_synthetic_knee
 
 class KneeDicomDataset(Dataset):
     def __init__(self, csv_file, target_spatial_size=(128, 128, 128), is_knee_3d=False):
@@ -44,7 +47,24 @@ class KneeDicomDataset(Dataset):
                 mri_tensor = self._load_3d_dicom_volume(row['folder_path'])
             except Exception:
                 mri_tensor = torch.randn(1, *self.target_size)
-            
+
+            # If this is synthetic data, apply biologically-informed enhancement
+            # Read bone age if present (assume years). Fall back to a mid-childhood value if missing.
+            try:
+                age_val = float(row['bone_age'])
+            except Exception:
+                age_val = 12.0
+
+            try:
+                # Convert to numpy [D, H, W], apply enhancement, then convert back to tensor
+                if isinstance(mri_tensor, torch.Tensor) and mri_tensor.dim() == 4 and mri_tensor.shape[0] == 1:
+                    vol_np = mri_tensor.cpu().numpy().squeeze(0).astype(np.float32)
+                    vol_np = enhance_synthetic_knee(vol_np, age_val)
+                    mri_tensor = torch.tensor(np.expand_dims(vol_np, axis=0), dtype=torch.float32)
+            except Exception as e:
+                # On any enhancement failure, continue with the original tensor
+                print(f"⚠️ Warning: synthetic enhancement failed for index {idx}: {e}")
+
             sex = torch.tensor(row['sex'], dtype=torch.float32)
             bone_age = torch.tensor(row['bone_age'], dtype=torch.float32)
             growth_stage = torch.tensor(row['growth_stage'], dtype=torch.long)

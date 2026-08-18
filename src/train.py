@@ -1,6 +1,7 @@
-import os
+import sys, os
 import torch
 import torch.nn as nn
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.model import KneeBoneAgeMultiTaskNet
 from src.predict import load_and_sort_dicom_volume
 

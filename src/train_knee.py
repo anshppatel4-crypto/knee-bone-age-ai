@@ -1,89 +1,101 @@
-from __future__ import annotations
-import sys, os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from pathlib import Path
-from typing import Optional
-import pandas as pd
+
+import os
+import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from src.dataset import KneeDicomDataset
-from src.model import KneeBoneAgeMultiTaskNet
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import pydicom
 
-def train_pipeline(data_catalog_csv: Optional[str] = None, epochs: int = 5, batch_size: int = 2) -> None:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training pipeline initialized. Active compute target: {device}")
-    repo_root = Path(__file__).resolve().parent.parent
+# -----------------------------
+# Dataset Loader
+# -----------------------------
+class KneeAgeDataset(Dataset):
+    def __init__(self, root):
+        self.samples = []
+        for folder in os.listdir(root):
+            path = os.path.join(root, folder)
+            if os.path.isdir(path):
+                # Extract age from folder name
+                age = float(folder.split("_")[3])
+                slices = sorted([os.path.join(path, f) for f in os.listdir(path) if f.endswith(".dcm")])
+                self.samples.append((slices, age))
 
-    rsna_path = repo_root / "boneage-training-dataset.csv"
-    if rsna_path.exists():
-        print(f"--> Found real pediatric dataset: {rsna_path.name}. Entering Pre-Training Mode.")
-        catalog_path = rsna_path
-        is_knee_3d = False 
-    else:
-        print("--> Real dataset sheet missing from root. Falling back to local data index mapping.")
-        catalog_path = Path(data_catalog_csv) if data_catalog_csv else repo_root / "data" / "data_catalog.csv"
-        is_knee_3d = True
+    def __len__(self):
+        return len(self.samples)
 
-    if not catalog_path.exists():
-        catalog_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame([{"folder_path": "data/imported_patient_scan", "sex": 1.0, "bone_age": 14.8, "growth_stage": 0}]).to_csv(catalog_path, index=False)
+    def __getitem__(self, idx):
+        slice_paths, age = self.samples[idx]
 
-    dataset = KneeDicomDataset(catalog_path, is_knee_3d=is_knee_3d)
-    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+        # Load all slices and stack into [D, H, W]
+        volume = []
+        for sp in slice_paths:
+            ds = pydicom.dcmread(sp)
+            img = ds.pixel_array.astype(np.float32)
+            img = img / 65535.0  # normalize
+            volume.append(img)
 
-    model = KneeBoneAgeMultiTaskNet(num_growth_stages=4).to(device)
+        volume = np.stack(volume, axis=0)  # [D, H, W]
+        volume = torch.tensor(volume).unsqueeze(0)  # [1, D, H, W]
 
-    # Attempt to load existing fine-tuned weights if available
-    prev_weights = repo_root / "final_knee_model_fine_tuned.pth"
-    if prev_weights.exists():
-        try:
-            model.load_state_dict(torch.load(prev_weights, map_location=device))
-            print(f"--> Loaded pre-existing weights from: {prev_weights.name}")
-        except Exception as e:
-            print(f"⚠️ Warning: failed to load existing weights ({prev_weights}): {e}")
+        return volume, torch.tensor(age, dtype=torch.float32)
 
-    # Freeze backbone initially for custom attention compatibility
-    for name, param in model.backbone.named_parameters():
-        param.requires_grad = False
-        
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3, weight_decay=1e-5)
-    # Use L1Loss for bone age regression as requested (more robust to outliers)
-    criterion_age = nn.L1Loss()
-    criterion_stage = nn.CrossEntropyLoss()
+# -----------------------------
+# Simple 3D CNN Model
+# -----------------------------
+class KneeAgeNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(1, 8, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool3d(2),
 
-    for epoch in range(epochs):
-        model.train()
-        running_age_loss = 0.0
-        running_stage_loss = 0.0
-        running_mae = 0.0
-        
-        for batch_idx, batch in enumerate(train_loader):
-            images = batch["image"].to(device)
-            sex = batch["sex"].to(device).float().view(-1, 1)
-            age_targets = batch["bone_age"].to(device).float().view(-1)
-            stage_targets = batch["growth_stage"].to(device).long().view(-1)
+            nn.Conv3d(8, 16, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool3d(2),
 
-            optimizer.zero_grad(set_to_none=True)
-            predicted_age, predicted_stage = model(images, sex)
+            nn.Conv3d(16, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool3d(1)
+        )
+        self.fc = nn.Linear(32, 1)
 
-            loss_age = criterion_age(predicted_age, age_targets)
-            loss_stage = criterion_stage(predicted_stage, stage_targets)
-            total_loss = loss_age + (2.0 * loss_stage)
+    def forward(self, x):
+        x = self.net(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
 
-            total_loss.backward()
-            optimizer.step()
+# -----------------------------
+# Training Loop
+# -----------------------------
+def train():
+    dataset = KneeAgeDataset("data/synthetic_knees_batch")
+    loader = DataLoader(dataset, batch_size=2, shuffle=True)
 
-            running_age_loss += loss_age.item()
-            running_stage_loss += loss_stage.item()
-            current_mae = torch.mean(torch.abs(predicted_age - age_targets)).item()
-            running_mae += current_mae
+    model = KneeAgeNet().cuda()
+    opt = optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = nn.L1Loss()  # MAE
 
-            print(f"Epoch {epoch + 1}/{epochs} | Batch {batch_idx + 1}/{len(train_loader)} | MAE={current_mae:.4f} years")
+    for epoch in range(20):
+        total_loss = 0
+        for volume, age in loader:
+            volume = volume.cuda()
+            age = age.cuda()
 
-    # Save out updated state representations cleanly (bio-physics enhanced fine-tune)
-    torch.save(model.state_dict(), repo_root / "final_knee_model_bio_physics.pth")
-    print("✅ Model bio-physics fine-tuning complete. Checkpoint exported as final_knee_model_bio_physics.pth")
+            pred = model(volume)
+            loss = loss_fn(pred.squeeze(), age)
+
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/20 — MAE: {total_loss/len(loader):.3f}")
+
+    torch.save(model.state_dict(), "knee_age_model.pth")
+    print("Model saved as knee_age_model.pth")
 
 if __name__ == "__main__":
-    train_pipeline()
+    train()

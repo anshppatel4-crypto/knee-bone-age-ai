@@ -1,57 +1,16 @@
 import sys, os
 import torch
 import numpy as np
-import pydicom
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from diffusers import StableDiffusionPipeline
 from scipy.ndimage import gaussian_filter1d
-from pydicom.dataset import FileDataset, Dataset
-from pydicom.uid import ExplicitVRLittleEndian, generate_uid
 
+from src.dicom_io import write_mr_series
 # Biological enhancer for synthetic MRI volumes
 from src.synthetic_biology import enhance_synthetic_knee
 
 # =========================================================================
-# HELPER 1: WRITING INDIVIDUAL CLINICAL DICOM FILES
-# =========================================================================
-def save_single_dicom_slice(pixel_array_2d, output_path, slice_idx, spacing_mm=3.0, patient_sex="M", target_age=12.5):
-    """Formats a raw 2D pixel image into an authentic medical DICOM file."""
-    # Scale image array to standard 16-bit unsigned integers used by scanners
-    pixel_array_2d = ((pixel_array_2d - pixel_array_2d.min()) / (pixel_array_2d.max() - pixel_array_2d.min() + 1e-8) * 65535).astype(np.uint16)
-    
-    # Instantiate standard DICOM metadata frameworks
-    file_meta = Dataset()
-    file_meta.TransferSyntaxUID = ExplicitVRLittleEndian
-    file_meta.MediaStorageSOPClassUID = '1.2.840.10008.5.1.4.1.1.4'  # MR Image Storage Code
-    file_meta.MediaStorageSOPInstanceUID = generate_uid()
-    
-    # Clean initialization without the deprecated keyword argument conflict
-    ds = FileDataset(output_path, {}, file_meta=file_meta)
-    
-    # Set explicit clinical byte patterns required by pydicom
-    ds.is_little_endian = True
-    ds.is_implicit_VR = False
-    
-    # Inject exact physical metadata required by your dataset.py script
-    ds.SliceLocation = float(slice_idx * spacing_mm)  # Track depth position precisely
-    ds.PatientSex = patient_sex
-    ds.PatientAge = f"{int(target_age * 12):03d}M"  # Age formatted in months
-    
-    # Set explicit resolution configurations
-    ds.Rows, ds.Columns = pixel_array_2d.shape
-    ds.PixelData = pixel_array_2d.tobytes()
-    ds.BitsAllocated = 16
-    ds.BitsStored = 16
-    ds.HighBit = 15
-    ds.PixelRepresentation = 0
-    ds.SamplesPerPixel = 1
-    ds.PhotometricInterpretation = "MONOCHROME2"
-    
-    ds.save_as(output_path)
-
-
-# =========================================================================
-# HELPER 2: ANATOMICALLY-CONSTRAINED 2.5D VOLUMETRIC SYNTHESIS
+# ANATOMICALLY-CONSTRAINED 2.5D VOLUMETRIC SYNTHESIS
 # =========================================================================
 def execute_25d_volumetric_generation(target_age=13.5, patient_sex="M", total_slices=16, output_dir="data/synthetic_knee_dense"):
     """Generates sequential cross-sectional frames enforced by a Physics-Guided
@@ -105,25 +64,12 @@ def execute_25d_volumetric_generation(target_age=13.5, patient_sex="M", total_sl
     # Baseline fine-frequency blurring to lock edge distributions
     smoothed_volume_matrix = gaussian_filter1d(volume_matrix, sigma=0.8, axis=0)
 
-    # Apply biologically-informed and MRI-physics based enhancements to the full volume
-    # ensure the enhancer receives a [D, H, W] numpy array and an age in years
-    try:
-        smoothed_volume_matrix = enhance_synthetic_knee(smoothed_volume_matrix.astype(np.float32), float(target_age))
-    except Exception as e:
-        # If enhancement fails for any reason, fall back to the smoothed result
-        print(f"⚠️ Warning: enhancement failed, continuing with smoothed volume: {e}")
+    # Age-dependent physeal/marrow biology and T2-like MRI physics on the full [D, H, W] volume
+    smoothed_volume_matrix = enhance_synthetic_knee(smoothed_volume_matrix, target_age)
 
-    # 3. Save each anatomically optimized frame directly into uncorrupted clinical binaries
-    print(f"💾 Committing processed volumes safely into raw DICOM binaries...")
-    for z in range(total_slices):
-        target_file_name = os.path.join(output_dir, f"slice_{z:03d}.dcm")
-        save_single_dicom_slice(
-            pixel_array_2d=smoothed_volume_matrix[z, :, :],
-            output_path=target_file_name,
-            slice_idx=z,
-            patient_sex=patient_sex,
-            target_age=target_age
-        )
+    # 3. Save the volume as a valid MR DICOM series
+    print("💾 Committing processed volume into a DICOM series...")
+    write_mr_series(smoothed_volume_matrix, output_dir, age_years=target_age, sex=patient_sex)
         
     print(f"✅ Success! Your valid 3D pediatric knee DICOM folder is fully populated at: {output_dir}")
 

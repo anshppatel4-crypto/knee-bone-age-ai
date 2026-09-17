@@ -8,7 +8,15 @@ def execute_scale_aware_inflation(pretrained_2d_path, output_3d_path):
     """Transforms 2D convolutional features into 3D using an advanced
 
     Depth-Aware Learnable Kernel distribution mapping matrix.
+
+    OBSOLETE: this belonged to the DenseNet pipeline, which inflated 2D hand X-ray
+    weights into 3D. The model now initialises from MedicalNet's 3D ResNet weights
+    (see src/model.py), so nothing needs inflating and the keys no longer match.
     """
+    raise NotImplementedError(
+        "Weight inflation is obsolete: KneeBoneAgeMultiTaskNet loads MedicalNet 3D "
+        "pretrained weights directly. Train with src/train.py instead."
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_3d = KneeBoneAgeMultiTaskNet()
     state_dict_3d = model_3d.state_dict()

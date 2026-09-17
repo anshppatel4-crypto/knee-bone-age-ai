@@ -4,7 +4,8 @@ import numpy as np
 from diffusers import StableDiffusionPipeline
 from scipy.ndimage import gaussian_filter1d
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from src.generate_25d import save_single_dicom_slice
+from src.dicom_io import write_mr_series
+from src.synthetic_biology import enhance_synthetic_knee
 
 def build_local_cohort():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -50,17 +51,12 @@ def build_local_cohort():
         # Apply your 2.5D smoothing physics filter
         volume_matrix = np.stack(generated_frames, axis=0)
         smoothed_volume = gaussian_filter1d(volume_matrix, sigma=1.0, axis=0)
-        
-        # Save out to your local folder
-        for z in range(total_slices):
-            target_path = os.path.join(pt["dir"], f"slice_{z:03d}.dcm")
-            save_single_dicom_slice(
-                pixel_array_2d=smoothed_volume[z, :, :],
-                output_path=target_path,
-                slice_idx=z,
-                patient_sex=pt["sex"],
-                target_age=pt["age"]
-            )
+
+        # Age-dependent physeal/marrow biology and T2-like MRI physics on the [D, H, W] volume
+        smoothed_volume = enhance_synthetic_knee(smoothed_volume, pt["age"])
+
+        # Save out to your local folder as a valid MR series
+        write_mr_series(smoothed_volume, pt["dir"], age_years=pt["age"], sex=pt["sex"])
     print("\n✅ Local cohort data folders successfully written to disk!")
 
 if __name__ == "__main__":

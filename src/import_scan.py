@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import argparse
 import pydicom
@@ -37,21 +38,31 @@ def ingest_recursive_dicom_folder(source_root, output_target_dir="data/imported_
         print("❌ Ingestion Failure: Unable to parse any valid DICOM series UIDs.")
         return None
 
-    best_series_uid = None
-    for uid, files in series_groups.items():
-        desc = series_descriptions.get(uid, "").lower()
-        if "ax" in desc or "axial" in desc or "localizer" in desc or "scout" in desc:
-            continue
-        if "sag" in desc or "cor" in desc or "t1" in desc or "structural" in desc:
-            best_series_uid = uid
-            break
+    def series_score(uid):
+        """Rank a series for bone age use; None means reject it outright.
 
-    if best_series_uid is None:
-        valid_uids = [u for u in series_groups.keys() if "ax" not in series_descriptions.get(u, "").lower()]
-        if valid_uids:
-            best_series_uid = max(valid_uids, key=lambda k: len(series_groups[k]))
-        else:
-            best_series_uid = max(series_groups, key=lambda k: len(series_groups[k]))
+        Matching whole words, not substrings: the old check rejected any description
+        containing 'ax', which also hits words like 'relax' and 'max'.
+        """
+        words = set(re.split(r"[^a-z0-9]+", series_descriptions.get(uid, "").lower()))
+        if words & {"ax", "axial", "tra", "transverse", "localizer", "loc", "scout", "survey"}:
+            return None
+
+        score = 0
+        if words & {"sag", "sagittal"}:
+            score += 4  # sagittal shows both growth plates end-on
+        if words & {"cor", "coronal"}:
+            score += 2
+        if words & {"pd", "t1", "t2", "fs", "tse", "spc"}:
+            score += 1
+        return score
+
+    ranked = [(score, len(series_groups[uid]), uid) for uid in series_groups
+              if (score := series_score(uid)) is not None]
+    if not ranked:  # everything looked like a localizer: fall back to the longest series
+        ranked = [(0, len(files), uid) for uid, files in series_groups.items()]
+
+    best_series_uid = max(ranked)[2]  # highest score, then most slices
 
     chosen_files = series_groups[best_series_uid]
     desc = series_descriptions.get(best_series_uid, "Unknown Sequence")

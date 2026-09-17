@@ -1,78 +1,78 @@
+"""Sanity checks that a checkpoint behaves sensibly: repeatable, noise-tolerant, order-aware."""
 import sys, os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-import torch
 import numpy as np
-from src.predict import load_and_sort_dicom_volume
-from src.model import KneeBoneAgeMultiTaskNet
-def load_model(weights):
+import torch
+from src.model import load_checkpoint
+from src.predict import predict_scan
+from src.preprocess import DEFAULT_INPUT_SHAPE, load_series
+
+
+def _setup(weights, scan_dir):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = KneeBoneAgeMultiTaskNet()
-    model.load_state_dict(torch.load(weights, map_location=device), strict=False)
-    model.to(device)
-    model.eval()
-    return model, device
+    model, metadata = load_checkpoint(weights, device)
+    volume = load_series(scan_dir, tuple(metadata.get("input_shape", DEFAULT_INPUT_SHAPE)))
+    return model, volume, device
+
 
 def repeat_test(scan_dir, sex, weights):
+    """Inference must be deterministic in eval mode."""
     print("\n=== REPEAT TEST ===")
-    model, device = load_model(weights)
+    model, volume, device = _setup(weights, scan_dir)
+    outputs = [predict_scan(model, volume, sex, device)["bone_age"] for _ in range(10)]
+    print("Outputs:", [round(o, 4) for o in outputs])
+    print("Range:", round(max(outputs) - min(outputs), 6))
 
-    vol = load_and_sort_dicom_volume(scan_dir)
-    vol_tensor = torch.tensor(vol).unsqueeze(0).unsqueeze(0).float().to(device)
-    sex_tensor = torch.tensor([[1.0 if sex=="M" else 0.0]]).float().to(device)
-
-    outputs = []
-    for _ in range(10):
-        with torch.no_grad():
-            age, _ = model(vol_tensor, sex_tensor)
-            outputs.append(age.item())
-
-    print("Outputs:", outputs)
-    print("Range:", max(outputs) - min(outputs))
 
 def noise_test(scan_dir, sex, weights):
+    """Small amounts of noise should barely move the prediction."""
     print("\n=== NOISE TEST ===")
-    model, device = load_model(weights)
+    model, volume, device = _setup(weights, scan_dir)
+    rng = np.random.default_rng(0)
+    baseline = predict_scan(model, volume, sex, device)["bone_age"]
+    print(f"Clean: {baseline:.4f}")
 
-    vol = load_and_sort_dicom_volume(scan_dir)
-    sex_tensor = torch.tensor([[1.0 if sex=="M" else 0.0]]).float().to(device)
+    for noise_level in [0.01, 0.05, 0.10]:
+        noisy = volume + rng.normal(0, noise_level, volume.shape)
+        age = predict_scan(model, noisy, sex, device)["bone_age"]
+        print(f"Noise {noise_level}: {age:.4f}  (delta {age - baseline:+.4f})")
 
-    for noise_level in [0.001, 0.005, 0.01]:
-        noisy = vol + np.random.normal(0, noise_level, vol.shape)
-        vol_tensor = torch.tensor(noisy).unsqueeze(0).unsqueeze(0).float().to(device)
-
-        with torch.no_grad():
-            age, _ = model(vol_tensor, sex_tensor)
-
-        print(f"Noise {noise_level}: {age.item():.4f}")
 
 def shuffle_test(scan_dir, sex, weights):
+    """Shuffling slices destroys 3D structure, so the prediction should change."""
     print("\n=== SLICE SHUFFLE TEST ===")
-    model, device = load_model(weights)
+    model, volume, device = _setup(weights, scan_dir)
+    rng = np.random.default_rng(0)
 
-    vol = load_and_sort_dicom_volume(scan_dir)
-    sex_tensor = torch.tensor([[1.0 if sex=="M" else 0.0]]).float().to(device)
+    shuffled = volume.copy()
+    rng.shuffle(shuffled)
+    print("Normal:  ", round(predict_scan(model, volume, sex, device)["bone_age"], 4))
+    print("Shuffled:", round(predict_scan(model, shuffled, sex, device)["bone_age"], 4))
 
-    # normal
-    vol_tensor = torch.tensor(vol).unsqueeze(0).unsqueeze(0).float().to(device)
-    with torch.no_grad():
-        base_age, _ = model(vol_tensor, sex_tensor)
 
-    # shuffled
-    shuffled = vol.copy()
-    np.random.shuffle(shuffled)
-    vol_tensor_shuf = torch.tensor(shuffled).unsqueeze(0).unsqueeze(0).float().to(device)
-    with torch.no_grad():
-        shuf_age, _ = model(vol_tensor_shuf, sex_tensor)
+def sex_sensitivity_test(scan_dir, sex, weights):
+    """Sex must matter: girls mature ~1.8 years ahead, so the same image means a
+    younger child if female. A model that ignores the sex input has found a shortcut."""
+    print()
+    print("=== SEX SENSITIVITY TEST ===")
+    model, volume, device = _setup(weights, scan_dir)
 
-    print("Normal:", base_age.item())
-    print("Shuffled:", shuf_age.item())
+    male = predict_scan(model, volume, "m", device)["bone_age"]
+    female = predict_scan(model, volume, "f", device)["bone_age"]
+    print(f"As male:   {male:.4f}")
+    print(f"As female: {female:.4f}")
+    print(f"Delta (M-F): {male - female:+.4f} years  (expected roughly +1.5 to +2.0)")
+    if abs(male - female) < 0.5:
+        print("⚠️  Model is ignoring sex - it is likely reading age off some other cue.")
+
 
 if __name__ == "__main__":
-    scan = "data/imported_patient_scan"
-    weights = "final_knee_model_fine_tuned.pth"
-    sex = "M"
+    scan = sys.argv[1] if len(sys.argv) > 1 else "data/imported_patient_scan"
+    weights = sys.argv[2] if len(sys.argv) > 2 else "final_knee_model_resnet34.pth"
+    sex = sys.argv[3] if len(sys.argv) > 3 else "F"
 
     repeat_test(scan, sex, weights)
     noise_test(scan, sex, weights)
     shuffle_test(scan, sex, weights)
+    sex_sensitivity_test(scan, sex, weights)

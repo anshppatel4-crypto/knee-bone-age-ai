@@ -17,3 +17,6 @@ models/
 # Ignore Python cache
 __pycache__/
 *.pyc
+
+# Model checkpoints (large binaries)
+*.pth

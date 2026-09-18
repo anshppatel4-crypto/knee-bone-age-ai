@@ -162,7 +162,7 @@ def predict_loader(model, loader, device, tta=True):
 # ---------------------------------------------------------------------------
 def train(data_patterns=DEFAULT_DATA_PATTERNS, output="final_knee_model_resnet34.pth", arch="resnet34",
           epochs=40, batch_size=4, lr=3e-4, input_shape=DEFAULT_INPUT_SHAPE, seed=0, limit=None,
-          patience=8, stage_loss_weight=0.3, num_workers=0, enhance_synthetic=False):
+          patience=8, stage_loss_weight=0.3, num_workers=0, enhance_synthetic=False, head="sigmoid"):
     torch.manual_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"💻 Training on {device}")
@@ -193,7 +193,9 @@ def train(data_patterns=DEFAULT_DATA_PATTERNS, output="final_knee_model_resnet34
     print(f"📏 Baseline (predict {mean_age:.1f}y): val MAE {baseline['val']['mae']:.2f} | "
           f"test MAE {baseline['test']['mae']:.2f}")
 
-    model = KneeBoneAgeMultiTaskNet(arch=arch, pretrained=True).to(device)
+    model = KneeBoneAgeMultiTaskNet(arch=arch, pretrained=True, head=head)
+    model.set_age_prior(mean_age)  # start at the mean instead of walking to it
+    model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, epochs=epochs,
                                                     steps_per_epoch=max(1, len(train_loader)), pct_start=0.25)
@@ -258,8 +260,8 @@ def train(data_patterns=DEFAULT_DATA_PATTERNS, output="final_knee_model_resnet34
     metrics_path = os.path.splitext(output)[0] + "_metrics.json"
     with open(metrics_path, "w", encoding="utf-8") as handle:
         json.dump({"test": test, "val_best_mae": best_mae, "baseline": baseline,
-                   "history": history, "arch": arch, "input_shape": list(input_shape),
-                   "n_scans": len(catalog)}, handle, indent=2)
+                   "history": history, "arch": arch, "head": head,
+                   "input_shape": list(input_shape), "n_scans": len(catalog)}, handle, indent=2)
     print(f"💾 Weights: {output}\n📊 Metrics: {metrics_path}")
     return test
 
@@ -276,8 +278,11 @@ if __name__ == "__main__":
     parser.add_argument("--limit", type=int, default=None, help="Use only N scans (quick smoke runs)")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--head", default="sigmoid", choices=["sigmoid", "linear"],
+                        help="'linear' drops the sigmoid*20 squashing that shrinks gradients "
+                             "at the ends of the age range")
     args = parser.parse_args()
 
     train(data_patterns=args.data, output=args.output, arch=args.arch, epochs=args.epochs,
           batch_size=args.batch_size, lr=args.lr, input_shape=tuple(args.input_shape),
-          limit=args.limit, num_workers=args.workers, seed=args.seed)
+          limit=args.limit, num_workers=args.workers, seed=args.seed, head=args.head)

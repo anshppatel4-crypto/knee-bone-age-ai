@@ -1,4 +1,5 @@
 from __future__ import annotations
+import numpy as np
 import torch
 from monai.networks.nets.resnet import get_medicalnet_pretrained_resnet_args, resnet18, resnet34
 from torch import nn
@@ -20,7 +21,7 @@ class KneeBoneAgeMultiTaskNet(nn.Module):
 
     def __init__(self, arch: str = "resnet34", num_growth_stages: int = 4,
                  pretrained: bool = True, dropout: float = 0.3,
-                 conditioning: str = "film") -> None:
+                 conditioning: str = "film", head: str = "sigmoid") -> None:
         super().__init__()
         if arch not in BACKBONES:
             raise ValueError(f"Unsupported arch '{arch}'. Choose from {sorted(BACKBONES)}.")
@@ -55,6 +56,13 @@ class KneeBoneAgeMultiTaskNet(nn.Module):
             self.feature_norm = nn.LayerNorm(feature_dim)
             self.film = nn.Linear(sex_dim, 2 * feature_dim)
 
+        # Squashing the output through sigmoid*20 bounds the age, but it also scales
+        # the gradient by 20*s*(1-s): reaching 3 or 17 years costs half the gradient of
+        # reaching 11, and 18 years costs a third. With a short schedule that shows up
+        # as predictions that never reach the ends of the range. "linear" removes the
+        # squashing; "sigmoid" is kept as the default so existing checkpoints load.
+        self.head = head
+
         self.fusion = nn.Sequential(
             nn.Linear(feature_dim + sex_dim, 256),
             nn.LayerNorm(256),
@@ -73,13 +81,28 @@ class KneeBoneAgeMultiTaskNet(nn.Module):
             features = self.feature_norm(features) * (1.0 + scale) + offset
 
         shared = self.fusion(torch.cat([features, sex_features], dim=1))
-        predicted_age = torch.sigmoid(self.regression_head(shared).squeeze(-1)) * MAX_AGE_YEARS
+        raw_age = self.regression_head(shared).squeeze(-1)
+        predicted_age = raw_age if self.head == "linear" else torch.sigmoid(raw_age) * MAX_AGE_YEARS
         return predicted_age, self.stage_head(shared)
+
+    @torch.no_grad()
+    def set_age_prior(self, mean_age: float) -> None:
+        """Start the regression head at the training mean rather than at 10 years.
+
+        Otherwise the first epochs are spent travelling to the middle of the age
+        range, which is wasted schedule on a 40-epoch budget.
+        """
+        self.regression_head.weight.zero_()
+        if self.head == "linear":
+            self.regression_head.bias.fill_(float(mean_age))
+        else:
+            ratio = min(max(mean_age / MAX_AGE_YEARS, 1e-4), 1 - 1e-4)
+            self.regression_head.bias.fill_(float(np.log(ratio / (1 - ratio))))
 
 
 def save_checkpoint(model: KneeBoneAgeMultiTaskNet, path: str, **metadata) -> None:
     """Store weights together with the architecture and metrics needed to rebuild and judge them."""
-    torch.save({"arch": model.arch, "conditioning": model.conditioning,
+    torch.save({"arch": model.arch, "conditioning": model.conditioning, "head": model.head,
                 "state_dict": model.state_dict(), **metadata}, path)
 
 
@@ -94,7 +117,8 @@ def load_checkpoint(path: str, device: torch.device | str = "cpu") -> tuple[Knee
 
     # Checkpoints written before FiLM conditioning existed used plain concatenation
     model = KneeBoneAgeMultiTaskNet(arch=checkpoint.get("arch", "resnet34"), pretrained=False,
-                                    conditioning=checkpoint.get("conditioning", "concat"))
+                                    conditioning=checkpoint.get("conditioning", "concat"),
+                                    head=checkpoint.get("head", "sigmoid"))
     model.load_state_dict(checkpoint["state_dict"])
     model.to(device).eval()
 

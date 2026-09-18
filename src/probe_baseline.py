@@ -14,6 +14,7 @@ tall, every fit is solved in the dual: the Gram matrix is computed once and each
 fold is then algebra on a small square array.
 """
 import argparse
+import json
 import os
 import sys
 import numpy as np
@@ -67,7 +68,8 @@ def probe(gram, targets, folds=5, seed=0):
     return predictions
 
 
-def run(data_patterns=DEFAULT_DATA_PATTERNS, input_shape=DEFAULT_INPUT_SHAPE, limit=None, seed=0):
+def run(data_patterns=DEFAULT_DATA_PATTERNS, input_shape=DEFAULT_INPUT_SHAPE, limit=None, seed=0,
+        out=None):
     catalog = build_catalog(data_patterns)
     if limit:
         catalog = catalog.sample(n=min(limit, len(catalog)), random_state=seed).reset_index(drop=True)
@@ -94,6 +96,16 @@ def run(data_patterns=DEFAULT_DATA_PATTERNS, input_shape=DEFAULT_INPUT_SHAPE, li
           f"corr {metrics['corr']:.3f} | within 1y {metrics['within_1y']:.0%}")
     print(f"\nA trained model scoring worse than {metrics['mae']:.2f} y, or flatter than "
           f"slope {metrics['slope']:.2f},\nis losing to linear regression on raw pixels.")
+
+    # Which fold a scan lands in moves MAE by a few hundredths of a year: two
+    # implementations of this probe scored 1.453 and 1.517 on the same 60 phantoms.
+    # It is a bar with a tolerance, not an exact threshold.
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            json.dump({"mae": metrics["mae"], "slope": metrics["slope"],
+                       "mean_age_mae": mean_age_mae, "n": metrics["n"],
+                       "input_shape": list(input_shape)}, handle, indent=2)
+        print(f"floor written to {out}")
     return metrics
 
 
@@ -103,5 +115,6 @@ if __name__ == "__main__":
     parser.add_argument("--input-shape", type=int, nargs=3, default=list(DEFAULT_INPUT_SHAPE))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out", default=None, help="Write the floor to this JSON file")
     args = parser.parse_args()
-    run(args.data, tuple(args.input_shape), args.limit, args.seed)
+    run(args.data, tuple(args.input_shape), args.limit, args.seed, args.out)

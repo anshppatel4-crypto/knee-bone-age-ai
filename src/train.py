@@ -99,6 +99,19 @@ def regression_metrics(predictions, targets):
     predictions, targets = np.asarray(predictions, float), np.asarray(targets, float)
     errors = predictions - targets
     variance = float(np.var(targets))
+
+    # Slope of predicted-on-true. A model that hedges toward the mean scores a
+    # respectable MAE while landing well under 1.0 here, so it is reported
+    # alongside MAE rather than left to be inferred from it.
+    # The mean-age baseline predicts a constant, so guard both variances: slope is 0
+    # there and correlation is genuinely undefined rather than merely awkward.
+    if variance > 1e-8 and len(targets) > 2:
+        slope = float(np.polyfit(targets, predictions, 1)[0])
+        correlation = (float(np.corrcoef(targets, predictions)[0, 1])
+                      if np.var(predictions) > 1e-8 else float("nan"))
+    else:
+        slope = correlation = float("nan")
+
     return {
         "n": int(len(targets)),
         "mae": float(np.mean(np.abs(errors))),
@@ -107,7 +120,23 @@ def regression_metrics(predictions, targets):
         "within_1y": float(np.mean(np.abs(errors) <= 1.0)),
         "within_2y": float(np.mean(np.abs(errors) <= 2.0)),
         "r2": float(1.0 - np.mean(errors ** 2) / variance) if variance > 1e-8 else float("nan"),
+        "slope": slope,
+        "corr": correlation,
+        "pred_range": [float(predictions.min()), float(predictions.max())],
+        "true_range": [float(targets.min()), float(targets.max())],
     }
+
+
+def seed_worker(worker_id):
+    """Fresh augmentation stream per worker, per epoch.
+
+    Workers are forked holding an identical copy of the dataset's RNG. PyTorch
+    draws a new base seed each epoch, so deriving from it keeps the workers
+    independent of each other and of the previous epoch.
+    """
+    info = torch.utils.data.get_worker_info()
+    if info is not None and hasattr(info.dataset, "reseed"):
+        info.dataset.reseed(torch.initial_seed() % (2 ** 32))
 
 
 @torch.no_grad()
@@ -149,7 +178,9 @@ def train(data_patterns=DEFAULT_DATA_PATTERNS, output="final_knee_model_resnet34
     val_set = KneeVolumeDataset(val_df, augment=False, **common)
     test_set = KneeVolumeDataset(test_df, augment=False, **common)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, drop_last=False)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+                              drop_last=False, worker_init_fn=seed_worker,
+                              persistent_workers=num_workers > 0, pin_memory=device.type == "cuda")
     val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=num_workers)
     test_loader = DataLoader(test_set, batch_size=batch_size, num_workers=num_workers)
 
@@ -219,6 +250,9 @@ def train(data_patterns=DEFAULT_DATA_PATTERNS, output="final_knee_model_resnet34
     print(f" RMSE         : {test['rmse']:.3f} years")
     print(f" Within 1 year: {test['within_1y']:.0%}     Within 2 years: {test['within_2y']:.0%}")
     print(f" Bias         : {test['bias']:+.3f} years   R²: {test['r2']:.3f}")
+    print(f" Slope        : {test['slope']:.3f}           corr: {test['corr']:.3f}")
+    print(f" Pred range   : {test['pred_range'][0]:.1f}-{test['pred_range'][1]:.1f}y "
+          f"(true {test['true_range'][0]:.1f}-{test['true_range'][1]:.1f}y)")
     print("=" * 58)
 
     metrics_path = os.path.splitext(output)[0] + "_metrics.json"
